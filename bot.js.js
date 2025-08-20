@@ -1,0 +1,863 @@
+const { Client, GatewayIntentBits, EmbedBuilder, ChannelType, PermissionFlagsBits, ButtonBuilder, ActionRowBuilder, ButtonStyle, Partials } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
+
+// Bot configuration
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.DirectMessageReactions,
+        GatewayIntentBits.GuildMembers
+    ],
+    partials: [
+        Partials.Message,
+        Partials.Channel,
+        Partials.Reaction,
+        Partials.User
+    ]
+});
+
+// In-memory storage (consider using a database for production)
+const activeTickets = new Map(); // userId -> { channelId, dmChannelId, ticketNumber, startTime, messages: [] }
+const ticketCounter = { count: 0 };
+
+// Ticket stats: userId -> number
+const statsFile = path.join(__dirname, 'ticket_stats.json');
+let ticketStats = {};
+if (fs.existsSync(statsFile)) {
+    try {
+        ticketStats = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
+    } catch (error) {
+        console.error('Error loading ticket stats:', error);
+    }
+}
+function saveTicketStats() {
+    fs.writeFileSync(statsFile, JSON.stringify(ticketStats, null, 2));
+}
+
+// For tracking if a user already got stat in a ticket: ticketId -> Set<userId>
+const ticketStatGiven = {}; // channelId -> Set<userId>
+
+// Load ticket counter from file if exists
+const counterFile = path.join(__dirname, 'ticket_counter.json');
+if (fs.existsSync(counterFile)) {
+    const data = JSON.parse(fs.readFileSync(counterFile, 'utf8'));
+    ticketCounter.count = data.count || 0;
+}
+
+// Save ticket counter to file
+function saveTicketCounter() {
+    fs.writeFileSync(counterFile, JSON.stringify(ticketCounter));
+}
+
+// Persistent storage for tickets
+const ticketsFile = path.join(__dirname, 'active_tickets.json');
+const offlineMessagesFile = path.join(__dirname, 'offline_messages.json');
+
+// Load active tickets from file
+function loadActiveTickets() {
+    if (fs.existsSync(ticketsFile)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(ticketsFile, 'utf8'));
+            Object.entries(data).forEach(([userId, ticket]) => {
+                activeTickets.set(userId, ticket);
+                // Initialize stat tracking for loaded tickets
+                if (ticket.channelId) {
+                    ticketStatGiven[ticket.channelId] = ticketStatGiven[ticket.channelId] || new Set();
+                }
+            });
+            console.log(`📥 Loaded ${activeTickets.size} active tickets from storage`);
+        } catch (error) {
+            console.error('Error loading active tickets:', error);
+        }
+    }
+}
+
+// Save active tickets to file
+function saveActiveTickets() {
+    try {
+        const ticketsObj = Object.fromEntries(activeTickets);
+        fs.writeFileSync(ticketsFile, JSON.stringify(ticketsObj, null, 2));
+    } catch (error) {
+        console.error('Error saving active tickets:', error);
+    }
+}
+
+// Load offline messages
+function loadOfflineMessages() {
+    if (fs.existsSync(offlineMessagesFile)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(offlineMessagesFile, 'utf8'));
+            return data || [];
+        } catch (error) {
+            console.error('Error loading offline messages:', error);
+            return [];
+        }
+    }
+    return [];
+}
+
+// Save offline message
+function saveOfflineMessage(userId, content, timestamp) {
+    try {
+        const offlineMessages = loadOfflineMessages();
+        offlineMessages.push({ userId, content, timestamp });
+        fs.writeFileSync(offlineMessagesFile, JSON.stringify(offlineMessages, null, 2));
+    } catch (error) {
+        console.error('Error saving offline message:', error);
+    }
+}
+
+// Clear offline messages
+function clearOfflineMessages() {
+    try {
+        if (fs.existsSync(offlineMessagesFile)) {
+            fs.unlinkSync(offlineMessagesFile);
+        }
+    } catch (error) {
+        console.error('Error clearing offline messages:', error);
+    }
+}
+
+// Configuration
+const CONFIG = {
+    SUPPORT_ROLE: 'SUPPORT',
+    TICKET_PING_ROLE: 'TICKET PING',
+    TICKET_CATEGORY: 'TICKETS', // Category for ticket channels
+    LOG_CHANNEL: 'ticket-logs', // Channel for ticket logs
+    PREFIX: '!r ', // Response prefix
+    MAX_TICKET_DURATION: 7 * 24 * 60 * 60 * 1000, // 7 days in milliseconds
+};
+
+client.once('ready', async () => {
+    console.log(`🔍 Bot can receive DMs: ${client.user.dmChannel}`);
+    console.log(`✅ ${client.user.tag} is online and ready!`);
+    console.log(`📊 Serving ${client.guilds.cache.size} servers`);
+    console.log(`🤖 Bot ID: ${client.user.id}`);
+    console.log(`🔧 Intents: ${client.options.intents}`);
+    console.log(`📦 Partials: ${client.options.partials}`);
+    
+    // Load persistent data
+    loadActiveTickets();
+    
+    // Process offline messages
+    await processOfflineMessages();
+    
+    // Test DM capability
+    try {
+        console.log(`🧪 Testing DM capability...`);
+        const testChannel = await client.user.createDM();
+        console.log(`✅ DM channel creation test passed`);
+    } catch (error) {
+        console.log(`❌ DM channel creation test failed:`, error.message);
+    }
+    
+    // Auto-close old tickets on startup
+    await checkAndCloseOldTickets();
+    
+    // Set up periodic cleanup (every hour)
+    setInterval(checkAndCloseOldTickets, 60 * 60 * 1000);
+    
+    // Set up periodic saves (every 5 minutes)
+    setInterval(() => {
+        saveActiveTickets();
+        saveTicketStats();
+    }, 5 * 60 * 1000);
+});
+
+// Process offline messages
+async function processOfflineMessages() {
+    const offlineMessages = loadOfflineMessages();
+    console.log(`📬 Processing ${offlineMessages.length} offline messages...`);
+    
+    for (const msg of offlineMessages) {
+        try {
+            const existingTicket = activeTickets.get(msg.userId);
+            if (existingTicket) {
+                const guild = client.guilds.cache.first();
+                const ticketChannel = guild?.channels.cache.get(existingTicket.channelId);
+                
+                if (ticketChannel) {
+                    // Store the offline message
+                    existingTicket.messages.push({
+                        author: existingTicket.username,
+                        content: `[OFFLINE MESSAGE] ${msg.content}`,
+                        timestamp: msg.timestamp,
+                        type: 'user'
+                    });
+
+                    const user = await client.users.fetch(msg.userId).catch(() => null);
+                    
+                    // Create offline message embed
+                    const offlineEmbed = new EmbedBuilder()
+                        .setAuthor({ 
+                            name: `${existingTicket.username} (User - Offline Message)`, 
+                            iconURL: user?.displayAvatarURL() || null
+                        })
+                        .setDescription(`📴 **Sent while bot was offline**\n\n${msg.content}`)
+                        .setColor(0xffa500)
+                        .setTimestamp(new Date(msg.timestamp))
+                        .setFooter({ text: 'Message recovered from downtime' });
+
+                    await ticketChannel.send({ embeds: [offlineEmbed] });
+                }
+            }
+        } catch (error) {
+            console.error('Error processing offline message:', error);
+        }
+    }
+    
+    // Clear processed offline messages
+    clearOfflineMessages();
+    console.log(`✅ Offline messages processed and cleared`);
+}
+
+// Handle DM messages (ticket creation/responses)
+client.on('messageCreate', async (message) => {
+    // Comprehensive debug logging
+    console.log(`\n📨 MESSAGE RECEIVED:`);
+    console.log(`   From: ${message.author.username}#${message.author.discriminator} (${message.author.id})`);
+    console.log(`   Channel: ${message.channel.id}`);
+    console.log(`   Channel Type: ${message.channel.type} (DM = ${ChannelType.DM})`);
+    console.log(`   Content: "${message.content}"`);
+    console.log(`   Is Bot: ${message.author.bot}`);
+    console.log(`   Is DM: ${message.channel.type === ChannelType.DM}`);
+    console.log(`   Guild: ${message.guild ? message.guild.name : 'None (DM)'}`);
+
+    if (message.author.bot) {
+        console.log(`   ⏩ Ignoring bot message`);
+        return;
+    }
+
+    // Handle DMs
+    if (message.channel.type === ChannelType.DM) {
+        console.log(`   🎫 Processing DM from ${message.author.username}`);
+        await handleDMMessage(message);
+        return;
+    }
+
+    // Handle support responses in ticket channels
+    if (message.guild && message.content.startsWith(CONFIG.PREFIX)) {
+        console.log(`   💬 Processing support response`);
+        await handleSupportResponse(message);
+        return;
+    }
+
+    // Handle stat tracking for users talking in ticket channels
+    if (message.guild) {
+        // Check if this is a ticket channel
+        const isTicketChannel = Array.from(activeTickets.values()).some(t => t.channelId === message.channel.id);
+        if (isTicketChannel && !message.author.bot) {
+            // Only give 1 stat per user per ticket
+            if (!ticketStatGiven[message.channel.id]) ticketStatGiven[message.channel.id] = new Set();
+            if (!ticketStatGiven[message.channel.id].has(message.author.id)) {
+                ticketStatGiven[message.channel.id].add(message.author.id);
+                if (!ticketStats[message.author.id]) ticketStats[message.author.id] = 0;
+                ticketStats[message.author.id]++;
+                saveTicketStats();
+            }
+        }
+    }
+
+    // Handle other commands
+    if (message.content.startsWith('!ticket')) {
+        console.log(`   🎯 Processing ticket command`);
+        await handleTicketCommands(message);
+    }
+});
+
+async function handleDMMessage(message) {
+    const userId = message.author.id;
+    const existingTicket = activeTickets.get(userId);
+
+    try {
+        if (!existingTicket) {
+            // Create new ticket
+            await createNewTicket(message);
+        } else {
+            // Forward message to support channel
+            await forwardUserMessage(message, existingTicket);
+        }
+    } catch (error) {
+        console.error('Error handling DM message:', error);
+        // Save message as offline message for recovery
+        saveOfflineMessage(userId, message.content, Date.now());
+        try {
+            await message.reply('❌ There was an error processing your message, but it has been saved. Our support team will see it when the issue is resolved.');
+        } catch (replyError) {
+            console.error('Could not send error reply to user:', replyError);
+        }
+    }
+}
+
+async function createNewTicket(message) {
+    const user = message.author;
+    const guild = client.guilds.cache.first(); // Get the first guild (modify for multiple servers)
+    
+    if (!guild) {
+        await message.reply('❌ Bot is not connected to any server.');
+        return;
+    }
+
+    try {
+        // Increment ticket counter
+        ticketCounter.count++;
+        saveTicketCounter();
+
+        // Find or create ticket category
+        let category = guild.channels.cache.find(c => 
+            c.type === ChannelType.GuildCategory && 
+            c.name.toLowerCase() === CONFIG.TICKET_CATEGORY.toLowerCase()
+        );
+
+        if (!category) {
+            category = await guild.channels.create({
+                name: CONFIG.TICKET_CATEGORY,
+                type: ChannelType.GuildCategory,
+                permissionOverwrites: [
+                    {
+                        id: guild.id,
+                        deny: [PermissionFlagsBits.ViewChannel],
+                    }
+                ]
+            });
+        }
+
+        // Find support role
+        const supportRole = guild.roles.cache.find(r => r.name === CONFIG.SUPPORT_ROLE);
+        if (!supportRole) {
+            await message.reply(`❌ Support role "${CONFIG.SUPPORT_ROLE}" not found. Please create it first.`);
+            return;
+        }
+        // Find TICKET PING role for mention
+        const ticketPingRole = guild.roles.cache.find(r => r.name === CONFIG.TICKET_PING_ROLE);
+
+        // Create ticket channel
+        const ticketChannel = await guild.channels.create({
+            name: `ticket-${ticketCounter.count}-${user.username}`,
+            type: ChannelType.GuildText,
+            parent: category.id,
+            permissionOverwrites: [
+                {
+                    id: guild.id,
+                    deny: [PermissionFlagsBits.ViewChannel],
+                },
+                {
+                    id: supportRole.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory
+                    ],
+                }
+            ]
+        });
+
+        // Store ticket info
+        const ticketData = {
+            channelId: ticketChannel.id,
+            dmChannelId: message.channel.id,
+            ticketNumber: ticketCounter.count,
+            startTime: Date.now(),
+            messages: [],
+            userId: user.id,
+            username: user.username
+        };
+        activeTickets.set(user.id, ticketData);
+
+        // Initialize stat tracking for this ticket
+        ticketStatGiven[ticketChannel.id] = new Set();
+
+        // Create ticket opened embed for support channel
+        const ticketEmbed = new EmbedBuilder()
+            .setTitle(`🎫 New Ticket #${ticketCounter.count}`)
+            .setDescription(`**User:** ${user.tag} (${user.id})\n**Created:** <t:${Math.floor(Date.now()/1000)}:R>`)
+            .addFields(
+                { name: '📝 Initial Message', value: message.content.length > 1024 ? message.content.substring(0, 1021) + '...' : message.content },
+                { name: '📋 Commands', value: '`!r <message>` - Reply to user\n`!close` - Close ticket\n`!transcript` - Generate transcript' }
+            )
+            .setColor(0x00ff00)
+            .setThumbnail(user.displayAvatarURL())
+            .setTimestamp();
+
+        // Add control buttons
+        const buttonRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`close_ticket_${user.id}`)
+                    .setLabel('Close Ticket')
+                    .setStyle(ButtonStyle.Danger)
+                    .setEmoji('🔒'),
+                new ButtonBuilder()
+                    .setCustomId(`transcript_${user.id}`)
+                    .setLabel('Generate Transcript')
+                    .setStyle(ButtonStyle.Secondary)
+                    .setEmoji('📋')
+            );
+
+        // Mention TICKET PING role if found, otherwise fallback to no mention
+        let contentMention = '';
+        if (ticketPingRole) {
+            contentMention = `<@&${ticketPingRole.id}>`;
+            await ticketChannel.send({ content: contentMention, allowedMentions: { roles: [ticketPingRole.id] } });
+        }
+        await ticketChannel.send({ embeds: [ticketEmbed], components: [buttonRow] });
+
+        // Store initial message
+        ticketData.messages.push({
+            author: user.username,
+            content: message.content,
+            timestamp: Date.now(),
+            type: 'user'
+        });
+
+        // Confirm ticket creation to user
+        const userEmbed = new EmbedBuilder()
+            .setTitle('🎫 Ticket Created Successfully!')
+            .setDescription(`Your ticket #${ticketCounter.count} has been created. Our support team will respond shortly.`)
+            .addFields(
+                { name: '💬 Your Message', value: message.content.length > 1024 ? message.content.substring(0, 1021) + '...' : message.content },
+                { name: '⏰ Response Time', value: 'Typically within 1-6 hours' },
+                { name: '📝 Next Steps', value: 'Continue messaging here and our support team will respond in this DM.' }
+            )
+            .setColor(0x00ff00)
+            .setTimestamp();
+
+        await message.reply({ embeds: [userEmbed] });
+
+        // Log ticket creation
+        await logTicketAction(guild, 'create', ticketData, user);
+        // Save tickets to persistent storage
+        saveActiveTickets();
+
+    } catch (error) {
+        console.error('Error creating ticket:', error);
+        await message.reply('❌ Failed to create ticket. Please try again later.');
+    }
+}
+
+async function forwardUserMessage(message, ticketData) {
+    const guild = client.guilds.cache.first();
+    const ticketChannel = guild?.channels.cache.get(ticketData.channelId);
+    
+    if (!ticketChannel) {
+        // Save message as offline message for recovery
+        saveOfflineMessage(message.author.id, message.content, Date.now());
+        await message.reply('❌ Your ticket channel was not found, but your message has been saved. Please create a new ticket or wait for the bot to recover.');
+        return;
+    }
+
+    // Store message
+    ticketData.messages.push({
+        author: message.author.username,
+        content: message.content,
+        timestamp: Date.now(),
+        type: 'user'
+    });
+
+    // Create user message embed
+    const userEmbed = new EmbedBuilder()
+        .setAuthor({ 
+            name: `${message.author.username} (User)`, 
+            iconURL: message.author.displayAvatarURL() 
+        })
+        .setDescription(message.content)
+        .setColor(0x3498db)
+        .setTimestamp();
+
+    await ticketChannel.send({ embeds: [userEmbed] });
+    
+    // Save to persistent storage
+    saveActiveTickets();
+}
+
+async function handleSupportResponse(message) {
+    if (!message.member.roles.cache.some(role => role.name === CONFIG.SUPPORT_ROLE)) {
+        return;
+    }
+
+    const responseContent = message.content.substring(CONFIG.PREFIX.length);
+    if (!responseContent.trim()) {
+        await message.reply('❌ Please provide a message to send.');
+        return;
+    }
+
+    // Find ticket by channel
+    const ticket = Array.from(activeTickets.values()).find(t => t.channelId === message.channel.id);
+    if (!ticket) {
+        await message.reply('❌ This is not a valid ticket channel.');
+        return;
+    }
+
+    try {
+        const user = await client.users.fetch(ticket.userId);
+        
+        // Get support member's display roles (ones with "Display separately" enabled)
+        const displayRoles = message.member.roles.cache
+            .filter(role => role.hoist && role.name !== '@everyone')
+            .sort((a, b) => b.position - a.position);
+        
+        const highestRole = displayRoles.first();
+        const roleInfo = highestRole ? `${highestRole.name}` : 'Support';
+
+        // Store message
+        ticket.messages.push({
+            author: `${message.author.username} (${roleInfo})`,
+            content: responseContent,
+            timestamp: Date.now(),
+            type: 'support'
+        });
+
+        // Send to user
+        const userEmbed = new EmbedBuilder()
+            .setAuthor({ 
+                name: `${message.author.username} (${roleInfo})`, 
+                iconURL: message.author.displayAvatarURL() 
+            })
+            .setDescription(responseContent)
+            .setColor(highestRole ? highestRole.color : 0xe74c3c)
+            .setTimestamp();
+
+        await user.send({ embeds: [userEmbed] });
+
+        // Confirm in ticket channel
+        const confirmEmbed = new EmbedBuilder()
+            .setAuthor({ 
+                name: `${message.author.username} (${roleInfo})`, 
+                iconURL: message.author.displayAvatarURL() 
+            })
+            .setDescription(`📤 **Sent to user:** ${responseContent}`)
+            .setColor(0x00ff00)
+            .setTimestamp();
+
+        await message.channel.send({ embeds: [confirmEmbed] });
+        await message.delete();
+
+    } catch (error) {
+        console.error('Error sending support response:', error);
+        await message.reply('❌ Failed to send message to user.');
+    }
+}
+
+async function handleTicketCommands(message) {
+    if (!message.member.roles.cache.some(role => role.name === CONFIG.SUPPORT_ROLE)) {
+        // Allow non-support to check their own stats
+        if (message.content.startsWith('!ticketstats')) {
+            await showPersonalTicketStats(message);
+        }
+        return;
+    }
+
+    const args = message.content.split(' ');
+    const command = args[1]?.toLowerCase();
+
+    switch (command) {
+        case 'close':
+            await closeTicket(message);
+            break;
+        case 'transcript':
+            await generateTranscript(message);
+            break;
+        case 'list':
+            await listActiveTickets(message);
+            break;
+        case 'stats':
+            await showTicketStats(message);
+            break;
+        default:
+            // Allow support to check any user's ticket stats
+            if (message.content.startsWith('!ticketstats')) {
+                await showPersonalTicketStats(message);
+                return;
+            }
+            const helpEmbed = new EmbedBuilder()
+                .setTitle('🎫 Ticket Commands')
+                .addFields(
+                    { name: '!r <message>', value: 'Reply to the user' },
+                    { name: '!ticket close', value: 'Close the current ticket' },
+                    { name: '!ticket transcript', value: 'Generate transcript' },
+                    { name: '!ticket list', value: 'List all active tickets' },
+                    { name: '!ticket stats', value: 'Show ticket statistics' },
+                    { name: '!ticketstats <userId>', value: 'Show personal ticket stats (or for another user by ID)' }
+                )
+                .setColor(0x3498db);
+            await message.reply({ embeds: [helpEmbed] });
+    }
+}
+
+async function closeTicket(message) {
+    const ticket = Array.from(activeTickets.values()).find(t => t.channelId === message.channel.id);
+    if (!ticket) {
+        await message.reply('❌ This is not a valid ticket channel.');
+        return;
+    }
+
+    try {
+        const user = await client.users.fetch(ticket.userId);
+        
+        // Generate final transcript
+        const transcript = generateTranscriptText(ticket);
+        
+        // Send closing message to user
+        const closingEmbed = new EmbedBuilder()
+            .setTitle('🔒 Ticket Closed')
+            .setDescription(`Your ticket #${ticket.ticketNumber} has been closed by ${message.author.username}.`)
+            .addFields(
+                { name: '📊 Ticket Summary', value: `Duration: <t:${Math.floor(ticket.startTime/1000)}:R> - <t:${Math.floor(Date.now()/1000)}:R>\nMessages: ${ticket.messages.length}` },
+                { name: '💬 Need more help?', value: 'Feel free to send another message to create a new ticket.' }
+            )
+            .setColor(0xe74c3c)
+            .setTimestamp();
+
+        await user.send({ embeds: [closingEmbed] });
+
+        // Log ticket closure
+        await logTicketAction(message.guild, 'close', ticket, user, message.author);
+
+        // Remove stat tracking for closed ticket
+        if (ticketStatGiven[ticket.channelId]) delete ticketStatGiven[ticket.channelId];
+
+        // Remove from active tickets
+        activeTickets.delete(ticket.userId);
+        saveActiveTickets();
+
+        // Delete channel after delay
+        await message.channel.send('🔒 Ticket will be deleted in 10 seconds...');
+        setTimeout(() => {
+            message.channel.delete().catch(console.error);
+        }, 10000);
+
+    } catch (error) {
+        console.error('Error closing ticket:', error);
+        await message.reply('❌ Failed to close ticket.');
+    }
+}
+
+async function generateTranscript(message) {
+    const ticket = Array.from(activeTickets.values()).find(t => t.channelId === message.channel.id);
+    if (!ticket) {
+        await message.reply('❌ This is not a valid ticket channel.');
+        return;
+    }
+
+    const transcript = generateTranscriptText(ticket);
+    const buffer = Buffer.from(transcript, 'utf-8');
+
+    const transcriptEmbed = new EmbedBuilder()
+        .setTitle(`📋 Transcript - Ticket #${ticket.ticketNumber}`)
+        .setDescription(`Generated by ${message.author.username}`)
+        .setColor(0x9b59b6)
+        .setTimestamp();
+
+    await message.reply({ 
+        embeds: [transcriptEmbed], 
+        files: [{ 
+            attachment: buffer, 
+            name: `ticket-${ticket.ticketNumber}-transcript.txt` 
+        }] 
+    });
+}
+
+function generateTranscriptText(ticket) {
+    let transcript = `TICKET TRANSCRIPT #${ticket.ticketNumber}\n`;
+    transcript += `User: ${ticket.username} (${ticket.userId})\n`;
+    transcript += `Created: ${new Date(ticket.startTime).toLocaleString()}\n`;
+    transcript += `Duration: ${Math.round((Date.now() - ticket.startTime) / (1000 * 60))} minutes\n`;
+    transcript += `Messages: ${ticket.messages.length}\n`;
+    transcript += `${'='.repeat(50)}\n\n`;
+
+    ticket.messages.forEach(msg => {
+        const timestamp = new Date(msg.timestamp).toLocaleString();
+        transcript += `[${timestamp}] ${msg.author}: ${msg.content}\n\n`;
+    });
+
+    return transcript;
+}
+
+async function listActiveTickets(message) {
+    if (activeTickets.size === 0) {
+        await message.reply('📭 No active tickets.');
+        return;
+    }
+
+    const ticketList = Array.from(activeTickets.values())
+        .map(ticket => `**#${ticket.ticketNumber}** - ${ticket.username} (<t:${Math.floor(ticket.startTime/1000)}:R>)`)
+        .join('\n');
+
+    const listEmbed = new EmbedBuilder()
+        .setTitle(`🎫 Active Tickets (${activeTickets.size})`)
+        .setDescription(ticketList)
+        .setColor(0x3498db)
+        .setTimestamp();
+
+    await message.reply({ embeds: [listEmbed] });
+}
+
+async function showTicketStats(message) {
+    const statsEmbed = new EmbedBuilder()
+        .setTitle('📊 Ticket Statistics')
+        .addFields(
+            { name: '🎫 Total Tickets Created', value: ticketCounter.count.toString(), inline: true },
+            { name: '📋 Currently Active', value: activeTickets.size.toString(), inline: true },
+            { name: '✅ Completed', value: (ticketCounter.count - activeTickets.size).toString(), inline: true }
+        )
+        .setColor(0x9b59b6)
+        .setTimestamp();
+
+    await message.reply({ embeds: [statsEmbed] });
+}
+
+async function showPersonalTicketStats(message) {
+    // !ticketstats <user-id> or just !ticketstats (default to self)
+    const args = message.content.split(' ');
+    let targetId = args[1];
+    // If invoked as !ticketstats and no ID, default to self
+    if (!targetId || isNaN(targetId)) {
+        targetId = message.author.id;
+    }
+    // Try to fetch user by ID
+    let userObj = null;
+    try {
+        userObj = await client.users.fetch(targetId);
+    } catch {}
+    const statNum = ticketStats[targetId] || 0;
+    const embed = new EmbedBuilder()
+        .setTitle('👤 Ticket Stats')
+        .setDescription(userObj ? `Stats for ${userObj.tag} (${targetId})` : `Stats for user ID: ${targetId}`)
+        .addFields(
+            { name: '🎟️ Unique Tickets Participated In', value: '' + statNum }
+        )
+        .setColor(0x3498db)
+        .setTimestamp();
+    await message.reply({ embeds: [embed] });
+}
+
+async function logTicketAction(guild, action, ticket, user, staff = null) {
+    const logChannel = guild.channels.cache.find(c => c.name === CONFIG.LOG_CHANNEL);
+    if (!logChannel) return;
+
+    const actionColors = {
+        create: 0x00ff00,
+        close: 0xff0000,
+        message: 0x3498db,
+        'auto-close': 0x95a5a6
+    };
+
+    const logEmbed = new EmbedBuilder()
+        .setTitle(`🎫 Ticket ${action.charAt(0).toUpperCase() + action.slice(1)}`)
+        .addFields(
+            { name: '🎫 Ticket', value: `#${ticket.ticketNumber}`, inline: true },
+            { name: '👤 User', value: `${user.tag} (${user.id})`, inline: true }
+        )
+        .setColor(actionColors[action] || 0x95a5a6)
+        .setTimestamp();
+
+    if (staff) {
+        logEmbed.addFields({ name: '👨‍💼 Staff', value: staff.tag, inline: true });
+    }
+
+    await logChannel.send({ embeds: [logEmbed] }).catch(console.error);
+}
+
+async function checkAndCloseOldTickets() {
+    const now = Date.now();
+    const expiredTickets = [];
+
+    for (const [userId, ticket] of activeTickets.entries()) {
+        if (now - ticket.startTime > CONFIG.MAX_TICKET_DURATION) {
+            expiredTickets.push({ userId, ticket });
+        }
+    }
+
+    for (const { userId, ticket } of expiredTickets) {
+        try {
+            const guild = client.guilds.cache.first();
+            const channel = guild?.channels.cache.get(ticket.channelId);
+            const user = await client.users.fetch(userId);
+
+            if (user) {
+                const expiredEmbed = new EmbedBuilder()
+                    .setTitle('⏰ Ticket Auto-Closed')
+                    .setDescription(`Your ticket #${ticket.ticketNumber} was automatically closed due to inactivity.`)
+                    .setColor(0x95a5a6)
+                    .setTimestamp();
+
+                await user.send({ embeds: [expiredEmbed] }).catch(console.error);
+            }
+
+            if (channel) {
+                await channel.delete().catch(console.error);
+            }
+
+            activeTickets.delete(userId);
+            if (ticketStatGiven[ticket.channelId]) delete ticketStatGiven[ticket.channelId];
+            await logTicketAction(guild, 'auto-close', ticket, user);
+        } catch (error) {
+            console.error('Error auto-closing ticket:', error);
+        }
+    }
+}
+
+// Handle button interactions
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    const [action, userId] = interaction.customId.split('_');
+    
+    if (action === 'close' && userId) {
+        if (!interaction.member.roles.cache.some(role => role.name === CONFIG.SUPPORT_ROLE)) {
+            await interaction.reply({ content: '❌ You need the SUPPORT role to close tickets.', ephemeral: true });
+            return;
+        }
+
+        // Simulate close command
+        const mockMessage = {
+            channel: interaction.channel,
+            guild: interaction.guild,
+            author: interaction.user,
+            reply: (content) => interaction.reply(content)
+        };
+        
+        await closeTicket(mockMessage);
+    }
+    
+    if (action === 'transcript' && userId) {
+        if (!interaction.member.roles.cache.some(role => role.name === CONFIG.SUPPORT_ROLE)) {
+            await interaction.reply({ content: '❌ You need the SUPPORT role to generate transcripts.', ephemeral: true });
+            return;
+        }
+
+        const mockMessage = {
+            channel: interaction.channel,
+            author: interaction.user,
+            reply: (content) => interaction.reply(content)
+        };
+        
+        await generateTranscript(mockMessage);
+    }
+});
+
+// Graceful shutdown handling
+process.on('SIGINT', () => {
+    console.log('📝 Saving data before shutdown...');
+    saveActiveTickets();
+    saveTicketCounter();
+    saveTicketStats();
+    console.log('✅ Data saved. Shutting down gracefully.');
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('📝 Saving data before shutdown...');
+    saveActiveTickets();
+    saveTicketCounter();
+    saveTicketStats();
+    console.log('✅ Data saved. Shutting down gracefully.');
+    process.exit(0);
+});
+
+// Login with your bot token
+client.login('MTQwMDE0MDc0MzU5NDQ3NTY4MQ.GuyL8w.dqmmfcHrdxBzAlFEyFlFenj4Z3UqOPpsrlvu9c');
