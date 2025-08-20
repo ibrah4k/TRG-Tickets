@@ -860,4 +860,5 @@ process.on('SIGTERM', () => {
 });
 
 // Login with your bot token
-client.login('MTQwMDE0MDc0MzU5NDQ3NTY4MQ.GuyL8w.dqmmfcHrdxBzAlFEyFlFenj4Z3UqOPpsrlvu9c');
+client.login(process.env.DISCORD_TOKEN);
+
